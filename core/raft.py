@@ -84,58 +84,70 @@ class RAFT(nn.Module):
 
 
     def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
-        """ Estimate optical flow between pair of frames """
-        #归一化
+        """ 估计一对帧之间的光流 """
+        # 归一化图像
         image1 = 2 * (image1 / 255.0) - 1.0
         image2 = 2 * (image2 / 255.0) - 1.0
 
+        # 将图像转换为连续内存格式
         image1 = image1.contiguous()
         image2 = image2.contiguous()
 
+        # 获取隐藏层和上下文层的维度
         hdim = self.hidden_dim
         cdim = self.context_dim
 
-        # run the feature network
+        # 运行特征网络以提取特征
         with autocast(enabled=self.args.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])        
         
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
+        
+        # 选择相关性计算方法
         if self.args.alternate_corr:
             corr_fn = AlternateCorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
         else:
             corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
 
-        # run the context network
+        # 运行上下文网络以提取上下文特征
         with autocast(enabled=self.args.mixed_precision):
             cnet = self.cnet(image1)
             net, inp = torch.split(cnet, [hdim, cdim], dim=1)
             net = torch.tanh(net)
             inp = torch.relu(inp)
 
+        # 初始化光流坐标
         coords0, coords1 = self.initialize_flow(image1)
 
+        # 如果提供了初始光流，则进行初始化
         if flow_init is not None:
             coords1 = coords1 + flow_init
 
         flow_predictions = []
         for itr in range(iters):
             coords1 = coords1.detach()
-            corr = corr_fn(coords1) # index correlation volume
+            # 计算相关性体积
+            corr = corr_fn(coords1)
 
+            # 计算当前光流
             flow = coords1 - coords0
             with autocast(enabled=self.args.mixed_precision):
+                # 更新网络状态，计算上采样掩码和光流增量
                 net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
 
-            # F(t+1) = F(t) + \Delta(t)
+            # 更新光流坐标
             coords1 = coords1 + delta_flow
 
-            # upsample predictions
+            # 上采样预测光流
             if up_mask is None:
+                # 如果没有上采样掩码，使用默认的上采样方法
                 flow_up = upflow8(coords1 - coords0)
             else:
+                # 使用上采样掩码进行上采样
                 flow_up = self.upsample_flow(coords1 - coords0, up_mask)
             
+            # 将上采样后的光流添加到预测列表中
             flow_predictions.append(flow_up)
 
         if test_mode:
